@@ -14,10 +14,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"errors"
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/stretchr/testify/require"
 )
+
+// ErrTimeout is the error when redis-server is TCP unreachable within its
+//  request timeout
+var ErrTimeout = errors.New("timeout")
 
 // ClusterConfig is the configuration to use for servers started in
 // redis-cluster mode. The value must contain a single reference to
@@ -29,6 +34,10 @@ cluster-config-file nodes.%[1]s.conf
 cluster-node-timeout 5000
 appendonly no
 `
+
+// NumStartupRetries is the number of retries to start a redis-server
+//  possible due to error "address already in use".
+const NumStartupRetries = 100
 
 // NumClusterNodes is the number of nodes started in a test cluster.
 // When a cluster is started with replicas, there is 1 replica per
@@ -49,7 +58,9 @@ func StartServer(t *testing.T, w io.Writer, conf string) (*exec.Cmd, string) {
 	}
 
 	port := getFreePort(t)
-	return startServerWithConfig(t, port, w, conf), port
+	// nolint
+	cmd, _ := startServerWithConfig(t, port, w, conf)
+	return cmd, port
 }
 
 // StartClusterWithReplicas starts a redis cluster of NumClusterNodes with
@@ -65,7 +76,8 @@ func StartClusterWithReplicas(t *testing.T, w io.Writer) (func(), []string) {
 	replicaMaster := make(map[string]string)
 	for _, master := range ports {
 		port := getClusterFreePort(t)
-		cmd := startServerWithConfig(t, port, w, fmt.Sprintf(ClusterConfig, port))
+		// nolint
+		cmd, _ := startServerWithConfig(t, port, w, fmt.Sprintf(ClusterConfig, port))
 		joinCluster(t, port, master)
 
 		replicaPorts = append(replicaPorts, port)
@@ -115,8 +127,23 @@ func StartCluster(t *testing.T, w io.Writer) (func(), []string) {
 
 	for i := 0; i < NumClusterNodes; i++ {
 		port := getClusterFreePort(t)
-		cmd := startServerWithConfig(t, port, w, fmt.Sprintf(ClusterConfig, port))
-		cmds[i], ports[i] = cmd, port
+		retries := NumStartupRetries
+		conf := fmt.Sprintf(ClusterConfig, port)
+
+		for {
+			cmd, err := startServerWithConfig(t, port, w, conf)
+			if err != nil {
+				if err == ErrTimeout {
+					retries--
+					require.NotZero(t, retries, "start redis-server failed all retries")
+				} else {
+					require.Nil(t, err)
+				}
+			} else {
+				cmds[i], ports[i] = cmd, port
+				break
+			}
+		}
 
 		// configure the cluster - add the slots and join
 		var meetPort string
@@ -297,7 +324,7 @@ func waitForCluster(t *testing.T, timeout time.Duration, ports ...string) bool {
 	return true
 }
 
-func startServerWithConfig(t *testing.T, port string, w io.Writer, conf string) *exec.Cmd {
+func startServerWithConfig(t *testing.T, port string, w io.Writer, conf string) (*exec.Cmd, error) {
 	var args []string
 	if conf == "" {
 		args = []string{"--port", port}
@@ -319,10 +346,14 @@ func startServerWithConfig(t *testing.T, port string, w io.Writer, conf string) 
 	require.NoError(t, c.Start(), "start redis-server")
 
 	// wait for the server to start accepting connections
-	require.True(t, waitForPort(port, 10*time.Second), "wait for redis-server")
+	started := waitForPort(port, 10*time.Second)
+	if !started {
+		t.Logf("wait for redis-server timeout")
+		return nil, ErrTimeout
+	}
 
 	t.Logf("redis-server started on port %s", port)
-	return c
+	return c, nil
 }
 
 func waitForPort(port string, timeout time.Duration) bool {
