@@ -16,7 +16,7 @@ import (
 	"time"
 	"errors"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	"github.com/stretchr/testify/require"
 )
 
